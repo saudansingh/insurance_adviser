@@ -1,0 +1,9 @@
+pyaudio==0.2.14
+google-genai
+fastapi
+uvicorn
+websockets
+python-dotenv
+python-multipart
+twilio
+gunicorn==23.0.0
