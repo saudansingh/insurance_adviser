@@ -2,8 +2,9 @@ import asyncio
 import logging
 import os
 from dotenv import load_dotenv
-import pyaudio
 from gemini_live import GeminiLive
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -16,13 +17,25 @@ logger = logging.getLogger(__name__)
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("MODEL", "gemini-3.1-flash-live-preview")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "cloud")  # "local" or "cloud"
 
-# Audio Format Configurations
-AUDIO_FORMAT = pyaudio.paInt16
+# Audio Format Configurations (for reference)
 CHANNELS = 1
 INPUT_RATE = 16000   # Mic input rate expected by Gemini Live
 OUTPUT_RATE = 24000  # Speaker output rate sent back by Gemini Live
 CHUNK_SIZE = 1024
+
+# Initialize FastAPI app
+app = FastAPI(title="Insurance Adviser API")
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def mic_audio_recorder(audio_input_queue: asyncio.Queue, input_stream):
@@ -50,13 +63,111 @@ async def speaker_audio_player(audio_playback_queue: asyncio.Queue, output_strea
             logger.error(f"Error playing audio: {e}")
 
 
-async def main():
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "Insurance Adviser API"}
+
+# WebSocket endpoint for live audio chat
+@app.websocket("/ws/chat")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time audio chat with Gemini Live API."""
+    await websocket.accept()
+    
+    if not GEMINI_API_KEY:
+        await websocket.send_json({"error": "GEMINI_API_KEY not configured"})
+        await websocket.close()
+        return
+    
+    try:
+        # Live API Stream Communication Queues
+        audio_input_queue = asyncio.Queue()
+        video_input_queue = asyncio.Queue()
+        text_input_queue = asyncio.Queue()
+        audio_playback_queue = asyncio.Queue()
+
+        # Audio callbacks
+        async def audio_output_callback(data):
+            """Send audio response back to client."""
+            await audio_playback_queue.put(data)
+
+        async def audio_interrupt_callback():
+            """Handle interruptions."""
+            while not audio_playback_queue.empty():
+                try:
+                    audio_playback_queue.get_nowait()
+                    audio_playback_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+        # Initialize Gemini Live Engine
+        gemini_client = GeminiLive(
+            api_key=GEMINI_API_KEY, 
+            model=MODEL, 
+            input_sample_rate=INPUT_RATE
+        )
+
+        # Handle incoming WebSocket messages
+        async def handle_websocket_messages():
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    await audio_input_queue.put(data)
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+
+        # Handle outgoing audio
+        async def send_audio_response():
+            try:
+                while True:
+                    audio_data = await audio_playback_queue.get()
+                    await websocket.send_bytes(audio_data)
+                    audio_playback_queue.task_done()
+            except Exception as e:
+                logger.error(f"Error sending audio: {e}")
+
+        # Start tasks
+        ws_task = asyncio.create_task(handle_websocket_messages())
+        audio_task = asyncio.create_task(send_audio_response())
+
+        # Run Gemini session
+        async for event in gemini_client.start_session(
+            audio_input_queue=audio_input_queue,
+            video_input_queue=video_input_queue,
+            text_input_queue=text_input_queue,
+            audio_output_callback=audio_output_callback,
+            audio_interrupt_callback=audio_interrupt_callback,
+        ):
+            if event and isinstance(event, dict):
+                text_content = event.get("text") or event.get("content")
+                if text_content:
+                    await websocket.send_json({"text": text_content})
+
+    except Exception as e:
+        logger.error(f"WebSocket session error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+# Local testing with microphone (optional, requires pyaudio)
+async def main_local():
+    """Run locally with microphone audio input."""
+    try:
+        import pyaudio
+    except ImportError:
+        print("PyAudio not installed. Install with: pip install pyaudio")
+        return
+    
     if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY is missing from your .env file.")
         return
 
     # Initialize PyAudio Engine
     p = pyaudio.PyAudio()
+    AUDIO_FORMAT = pyaudio.paInt16
 
     # Open Hardware Microphone Stream (16kHz)
     input_stream = p.open(
@@ -79,17 +190,12 @@ async def main():
     audio_input_queue = asyncio.Queue()
     video_input_queue = asyncio.Queue()
     text_input_queue = asyncio.Queue()
-    
-    # Internal queue to sequentialize outbound speaker playback
     audio_playback_queue = asyncio.Queue()
 
-    # Audio Callback definitions bound to the stream handler
     async def audio_output_callback(data):
-        """Triggered when Gemini sends back raw speech packets."""
         await audio_playback_queue.put(data)
 
     async def audio_interrupt_callback():
-        """Triggered automatically if you speak over Gemini while it is talking."""
         print("\n[Interrupted] Clearing agent response queue...")
         while not audio_playback_queue.empty():
             try:
@@ -98,19 +204,16 @@ async def main():
             except asyncio.QueueEmpty:
                 break
 
-    # Initialize Gemini Live Engine
     gemini_client = GeminiLive(
         api_key=GEMINI_API_KEY, model=MODEL, input_sample_rate=INPUT_RATE
     )
 
-    # Start concurrent background loops for audio hardware processing
     record_task = asyncio.create_task(mic_audio_recorder(audio_input_queue, input_stream))
     play_task = asyncio.create_task(speaker_audio_player(audio_playback_queue, output_stream))
 
-    print("🎙️  Voice Session Started! Start talking into your microphone... (Ctrl+C to stop)")
+    print("🎙️  Voice Session Started! Start talking...")
 
     try:
-        # Fixed syntax error line: running the asynchronous loop over the session generator directly
         async for event in gemini_client.start_session(
             audio_input_queue=audio_input_queue,
             video_input_queue=video_input_queue,
@@ -119,20 +222,15 @@ async def main():
             audio_interrupt_callback=audio_interrupt_callback,
         ):
             if event and isinstance(event, dict):
-                # Print text transcription alongside the voice output if available
                 text_content = event.get("text") or event.get("content")
                 if text_content:
                     print(text_content, end="", flush=True)
-
     except Exception as e:
         import traceback
-        print(f"\nSession closed due to error:\n{traceback.format_exc()}")
+        print(f"\nSession closed: {traceback.format_exc()}")
     finally:
-        # Clean up active asynchronous workers
         record_task.cancel()
         play_task.cancel()
-        
-        # Stop and close hardware stream instances gracefully
         try:
             input_stream.stop_stream()
             input_stream.close()
@@ -141,11 +239,19 @@ async def main():
             p.terminate()
         except Exception:
             pass
-        print("\n🔒 Audio engine safely disconnected.")
+        print("\n🔒 Audio engine disconnected.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
+    if ENVIRONMENT == "local":
+        # Run with microphone
+        try:
+            asyncio.run(main_local())
+        except KeyboardInterrupt:
+            print("\nShutdown...")
+    else:
+        # Run FastAPI server for Cloud Run
+        import uvicorn
+        port = int(os.getenv("PORT", 8000))
+        uvicorn.run(app, host="0.0.0.0", port=port)
         print("\nSession stopped by user.")

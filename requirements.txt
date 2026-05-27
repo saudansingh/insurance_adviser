@@ -1,4 +1,3 @@
-pyaudio==0.2.14
 google-genai
 fastapi
 uvicorn
