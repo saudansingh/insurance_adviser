@@ -37,6 +37,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Validate configuration on startup."""
+    if not GEMINI_API_KEY:
+        logger.warning("WARNING: GEMINI_API_KEY is not set. WebSocket endpoints will not work.")
+    logger.info("Insurance Adviser API started successfully")
+
 
 async def mic_audio_recorder(audio_input_queue: asyncio.Queue, input_stream):
     """Continuously captures microphone input and feeds it into Gemini's input queue."""
@@ -64,9 +72,13 @@ async def speaker_audio_player(audio_playback_queue: asyncio.Queue, output_strea
 
 
 # Health check endpoint
+@app.get("/")
+async def root():
+    return {"message": "Insurance Adviser API is running"}
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "Insurance Adviser API"}
+    return {"status": "healthy", "service": "Insurance Adviser API", "version": "1.0"}
 
 # WebSocket endpoint for live audio chat
 @app.websocket("/ws/chat")

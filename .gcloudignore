@@ -1,0 +1,38 @@
+# .gcloudignore file for Google Cloud Build
+
+# Git
+.git
+.gitignore
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Development
+.env
+.env.local
+node_modules/
+
+# Build
+dist/
+build/
+*.tar.gz
