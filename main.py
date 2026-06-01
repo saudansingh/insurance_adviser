@@ -8,7 +8,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # 🛠️ DB IMPORTS: Maps user context tracking engines seamlessly
-from database import async_session, get_or_create_user, load_memory, save_summary
+from database import async_session, get_or_create_user, load_memory
 
 # Load environment variables
 load_dotenv()
