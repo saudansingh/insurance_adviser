@@ -6,9 +6,10 @@ from dotenv import load_dotenv
 from gemini_live import GeminiLive
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
 
-# 🛠️ DB IMPORTS: Maps user context tracking engines seamlessly
-from database import async_session, get_or_create_user, load_memory, save_summary
+# 🛠️ DB IMPORTS: Synchronized with Agent 1's memory tracking models
+from database import async_session, get_or_create_user, load_memory, save_summary, SessionSummary
 
 # Load environment variables
 load_dotenv()
@@ -28,13 +29,40 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "cloud")  # "local" or "cloud"
 # =========================================================================
 AGENT_ID = "insurance-adviser-agent"
 
-# Audio Format Configurations (for reference)
+# Audio Format Configurations
 CHANNELS = 1
 INPUT_RATE = 16000   # Mic input rate expected by Gemini Live
 OUTPUT_RATE = 24000  # Speaker output rate sent back by Gemini Live
 CHUNK_SIZE = 1024
 
-# Modern Lifespan utility replaces deprecated @app.on_event
+
+# 🛠️ ADAPTED FROM AGENT 1: Creates or updates a unique session row by ID
+async def save_session_summary(summary_id: int | None, user_id: int, conversation_text: str) -> int:
+    """Create or update session summary row by ID. Returns row ID."""
+    try:
+        async with async_session() as session:
+            if summary_id:
+                result = await session.execute(
+                    select(SessionSummary).where(SessionSummary.id == summary_id, SessionSummary.agent_id == AGENT_ID)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.summary = conversation_text
+                    await session.commit()
+                    logger.info(f"Updated summary row {summary_id} for user {user_id}")
+                    return summary_id
+
+            new_summary = SessionSummary(user_id=user_id, summary=conversation_text, agent_id=AGENT_ID)
+            session.add(new_summary)
+            await session.commit()
+            await session.refresh(new_summary)
+            logger.info(f"Created summary row {new_summary.id} for user {user_id}")
+            return new_summary.id
+    except Exception as e:
+        logger.error(f"Failed to save session summary: {e}")
+        return summary_id or 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Validate configuration on startup."""
@@ -109,6 +137,7 @@ async def websocket_endpoint(websocket: WebSocket):
     ws_task = None
     audio_task = None
     user_id = None
+    session_summary_id = None         # 🛠️ TRACKER ADDED: Mirroring Agent 1's architecture
     current_call_text_segments = []  # Tracks live transcript tokens for summarizing
 
     # Wrap entire connection context in an active database connection
@@ -121,9 +150,9 @@ async def websocket_endpoint(websocket: WebSocket):
             past_chat_summary = await load_memory(user_id, AGENT_ID, db_session)
 
             # 3. Construct dynamic system instructions containing isolation memory context
-            system_instruction = "You are a helpful and professional voice insurance adviser."
-            if past_chat_summary:
-                system_instruction += f" Context from your past interactions with this user: {past_chat_summary}"
+            system_instruction = "You are Ankur, a helpful and professional voice insurance adviser."
+            if past_chat_summary and 'ChatContext object at' not in past_chat_summary:
+                system_instruction += f"\n\nPREVIOUS CONVERSATION SUMMARY:\n{past_chat_summary}\n\nRemember to acknowledge this context naturally."
 
             # Live API Stream Communication Queues
             audio_input_queue = asyncio.Queue()
@@ -185,25 +214,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 if event and isinstance(event, dict):
                     text_content = event.get("text") or event.get("content")
                     if text_content:
-                        # ✅ KEPT: Append response strings to build the background transcript block
+                        # Accumulate text behind the scenes
                         current_call_text_segments.append(text_content)
                         
-                        # 🛠️ REMOVED: await websocket.send_json({"text": text_content})
-                        # Dropping this line ensures the frontend UI receives no text frames, keeping it clean!
+                        # Incremental Background Sync (Saves progress periodically when sentences finish)
+                        if text_content.endswith(('.', '?', '!')) and user_id:
+                            conversation_text = "".join(current_call_text_segments).strip()
+                            session_summary_id = await save_session_summary(
+                                session_summary_id, user_id, conversation_text
+                            )
+                        
+                        # ❌ REMOVED: Streaming text directly to the UI is disabled.
 
         except WebSocketDisconnect:
             logger.info(f"WebSocket disconnected naturally for user {user_email}")
         except Exception as e:
             logger.error(f"WebSocket session error: {e}")
         finally:
-            # Summary persistence is executed inside the finally block.
+            # 🚀 FINALIZATION LAYER: Ensures the absolute latest data snapshot is fully written out 
             if user_id and current_call_text_segments:
-                summary_text = "".join(current_call_text_segments).strip()
-                if summary_text:
+                conversation_text = "".join(current_call_text_segments).strip()
+                if conversation_text:
                     try:
-                        logger.info(f"Connection ending. Saving Insurance record summary for User ID: {user_id}")
-                        # 🛠️ CHANGED: Swapped summary_text[:400] to full summary_text to store the entire conversation block inside the DB
-                        await save_summary(user_id, summary_text, AGENT_ID, db_session)
+                        logger.info(f"Connection ending. Making final data entry update for User ID: {user_id}")
+                        await save_session_summary(session_summary_id, user_id, conversation_text)
                     except Exception as save_err:
                         logger.error(f"Failed to auto-save summary context block: {save_err}")
 
@@ -311,7 +345,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\nShutdown...")
     else:
-        # Run FastAPI server for Cloud Run
         import uvicorn
         port = int(os.getenv("PORT", 8080))
         uvicorn.run(app, host="0.0.0.0", port=port)
