@@ -1,14 +1,10 @@
 import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from gemini_live import GeminiLive
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-
-# 🛠️ DB IMPORTS: Maps user context tracking engines seamlessly
-from database import async_session, get_or_create_user, load_memory, save_summary
 
 # Load environment variables
 load_dotenv()
@@ -23,28 +19,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("MODEL", "gemini-3.1-flash-live-preview")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "cloud")  # "local" or "cloud"
 
-# =========================================================================
-# 🎯 TARGET IDENTIFIER: Unique signature for the Insurance Agent
-# =========================================================================
-AGENT_ID = "insurance-adviser-agent"
-
 # Audio Format Configurations (for reference)
 CHANNELS = 1
 INPUT_RATE = 16000   # Mic input rate expected by Gemini Live
 OUTPUT_RATE = 24000  # Speaker output rate sent back by Gemini Live
 CHUNK_SIZE = 1024
 
-# 🛠️ CHANGED: Modern Lifespan utility replaces deprecated @app.on_event
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Validate configuration on startup."""
-    if not GEMINI_API_KEY:
-        logger.warning("WARNING: GEMINI_API_KEY is not set. WebSocket endpoints will not work.")
-    logger.info("Insurance Adviser API started successfully")
-    yield
-
-# Initialize FastAPI app with lifespan handler
-app = FastAPI(title="Insurance Adviser API", lifespan=lifespan)
+# Initialize FastAPI app
+app = FastAPI(title="Insurance Adviser API")
 
 # Add CORS
 app.add_middleware(
@@ -55,11 +37,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Validate configuration on startup."""
+    if not GEMINI_API_KEY:
+        logger.warning("WARNING: GEMINI_API_KEY is not set. WebSocket endpoints will not work.")
+    logger.info("Insurance Adviser API started successfully")
+
 
 async def mic_audio_recorder(audio_input_queue: asyncio.Queue, input_stream):
     """Continuously captures microphone input and feeds it into Gemini's input queue."""
     while True:
         try:
+            # Read raw PCM data from the microphone without blocking the main loop
             data = await asyncio.to_thread(input_stream.read, CHUNK_SIZE, False)
             if data:
                 await audio_input_queue.put(data)
@@ -73,13 +64,14 @@ async def speaker_audio_player(audio_playback_queue: asyncio.Queue, output_strea
     while True:
         try:
             data = await audio_playback_queue.get()
+            # Write raw PCM data out to hardware speakers
             await asyncio.to_thread(output_stream.write, data)
             audio_playback_queue.task_done()
         except Exception as e:
             logger.error(f"Error playing audio: {e}")
 
 
-# Health check endpoints
+# Health check endpoint
 @app.get("/")
 async def root():
     return {"message": "Insurance Adviser API is running"}
@@ -87,7 +79,6 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "Insurance Adviser API", "version": "1.0"}
-
 
 # WebSocket endpoint for live audio chat
 @app.websocket("/ws/chat")
@@ -99,123 +90,78 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_json({"error": "GEMINI_API_KEY not configured"})
         await websocket.close()
         return
-
-    user_email = websocket.query_params.get("email")
-    if not user_email:
-        await websocket.send_json({"error": "Missing 'email' connection parameter."})
-        await websocket.close()
-        return
     
-    ws_task = None
-    audio_task = None
-    user_id = None
-    current_call_text_segments = []  # Tracks live transcript tokens for summarizing
+    try:
+        # Live API Stream Communication Queues
+        audio_input_queue = asyncio.Queue()
+        video_input_queue = asyncio.Queue()
+        text_input_queue = asyncio.Queue()
+        audio_playback_queue = asyncio.Queue()
 
-    # Wrap entire connection context in an active database connection
-    async with async_session() as db_session:
-        try:
-            # 1. Look up user integer ID or generate a row if they are new
-            user_id = await get_or_create_user(user_email, db_session)
+        # Audio callbacks
+        async def audio_output_callback(data):
+            """Send audio response back to client."""
+            await audio_playback_queue.put(data)
 
-            # 2. Extract context history exclusively belonging to THIS user and agent
-            past_chat_summary = await load_memory(user_id, AGENT_ID, db_session)
-
-            # 3. Construct dynamic system instructions containing isolation memory context
-            system_instruction = "You are a helpful and professional voice insurance adviser."
-            if past_chat_summary:
-                system_instruction += f" Context from your past interactions with this user: {past_chat_summary}"
-
-            # Live API Stream Communication Queues
-            audio_input_queue = asyncio.Queue()
-            video_input_queue = asyncio.Queue()
-            text_input_queue = asyncio.Queue()
-            audio_playback_queue = asyncio.Queue()
-
-            # Audio callbacks
-            async def audio_output_callback(data):
-                await audio_playback_queue.put(data)
-
-            async def audio_interrupt_callback():
-                while not audio_playback_queue.empty():
-                    try:
-                        audio_playback_queue.get_nowait()
-                        audio_playback_queue.task_done()
-                    except asyncio.QueueEmpty:
-                        break
-
-            # Initialize Gemini Live Engine with the historical memory injected
-            gemini_client = GeminiLive(
-                api_key=GEMINI_API_KEY, 
-                model=MODEL, 
-                input_sample_rate=INPUT_RATE,
-                system_instruction=system_instruction
-            )
-
-            # Handle incoming WebSocket messages
-            async def handle_websocket_messages():
+        async def audio_interrupt_callback():
+            """Handle interruptions."""
+            while not audio_playback_queue.empty():
                 try:
-                    while True:
-                        data = await websocket.receive_bytes()
-                        await audio_input_queue.put(data)
-                except (WebSocketDisconnect, Exception):
-                    # Clean mute during standard user disconnects
-                    pass
+                    audio_playback_queue.get_nowait()
+                    audio_playback_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
 
-            # Handle outgoing audio
-            async def send_audio_response():
-                try:
-                    while True:
-                        audio_data = await audio_playback_queue.get()
-                        await websocket.send_bytes(audio_data)
-                        audio_playback_queue.task_done()
-                except (WebSocketDisconnect, Exception):
-                    # Clean mute during standard user disconnects
-                    pass
+        # Initialize Gemini Live Engine
+        gemini_client = GeminiLive(
+            api_key=GEMINI_API_KEY, 
+            model=MODEL, 
+            input_sample_rate=INPUT_RATE
+        )
 
-            # Start background tasks
-            ws_task = asyncio.create_task(handle_websocket_messages())
-            audio_task = asyncio.create_task(send_audio_response())
-
-            # Run Gemini streaming session loop
-            async for event in gemini_client.start_session(
-                audio_input_queue=audio_input_queue,
-                video_input_queue=video_input_queue,
-                text_input_queue=text_input_queue,
-                audio_output_callback=audio_output_callback,
-                audio_interrupt_callback=audio_interrupt_callback,
-            ):
-                if event and isinstance(event, dict):
-                    text_content = event.get("text") or event.get("content")
-                    if text_content:
-                        # Append the agent response strings to compile a record
-                        current_call_text_segments.append(text_content)
-                        await websocket.send_json({"text": text_content})
-
-        except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected naturally for user {user_email}")
-        except Exception as e:
-            logger.error(f"WebSocket session error: {e}")
-        finally:
-            # 🛠️ CHANGED: Summary persistence is now executed inside finally block.
-            # This ensures saving works even during abrupt page-closes/hang-ups.
-            if user_id and current_call_text_segments:
-                summary_text = "".join(current_call_text_segments).strip()
-                if summary_text:
-                    try:
-                        logger.info(f"Connection ending. Saving Insurance record summary for User ID: {user_id}")
-                        await save_summary(user_id, summary_text[:400], AGENT_ID, db_session)
-                    except Exception as save_err:
-                        logger.error(f"Failed to auto-save summary context block: {save_err}")
-
-            # Clean up pending loops safely
-            if ws_task and not ws_task.done():
-                ws_task.cancel()
-            if audio_task and not audio_task.done():
-                audio_task.cancel()
+        # Handle incoming WebSocket messages
+        async def handle_websocket_messages():
             try:
-                await websocket.close()
-            except Exception:
-                pass
+                while True:
+                    data = await websocket.receive_bytes()
+                    await audio_input_queue.put(data)
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+
+        # Handle outgoing audio
+        async def send_audio_response():
+            try:
+                while True:
+                    audio_data = await audio_playback_queue.get()
+                    await websocket.send_bytes(audio_data)
+                    audio_playback_queue.task_done()
+            except Exception as e:
+                logger.error(f"Error sending audio: {e}")
+
+        # Start tasks
+        ws_task = asyncio.create_task(handle_websocket_messages())
+        audio_task = asyncio.create_task(send_audio_response())
+
+        # Run Gemini session
+        async for event in gemini_client.start_session(
+            audio_input_queue=audio_input_queue,
+            video_input_queue=video_input_queue,
+            text_input_queue=text_input_queue,
+            audio_output_callback=audio_output_callback,
+            audio_interrupt_callback=audio_interrupt_callback,
+        ):
+            if event and isinstance(event, dict):
+                text_content = event.get("text") or event.get("content")
+                if text_content:
+                    await websocket.send_json({"text": text_content})
+
+    except Exception as e:
+        logger.error(f"WebSocket session error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 # Local testing with microphone (optional, requires pyaudio)
@@ -231,9 +177,11 @@ async def main_local():
         print("Error: GEMINI_API_KEY is missing from your .env file.")
         return
 
+    # Initialize PyAudio Engine
     p = pyaudio.PyAudio()
     AUDIO_FORMAT = pyaudio.paInt16
 
+    # Open Hardware Microphone Stream (16kHz)
     input_stream = p.open(
         format=AUDIO_FORMAT,
         channels=CHANNELS,
@@ -242,6 +190,7 @@ async def main_local():
         frames_per_buffer=CHUNK_SIZE
     )
 
+    # Open Hardware Speaker Stream (24kHz)
     output_stream = p.open(
         format=AUDIO_FORMAT,
         channels=CHANNELS,
@@ -249,6 +198,7 @@ async def main_local():
         output=True
     )
 
+    # Live API Stream Communication Queues
     audio_input_queue = asyncio.Queue()
     video_input_queue = asyncio.Queue()
     text_input_queue = asyncio.Queue()
@@ -306,7 +256,7 @@ async def main_local():
 
 if __name__ == "__main__":
     if ENVIRONMENT == "local":
-        # 🛠️ CHANGED: Removed broken async block out of synchronous space
+        # Run with microphone
         try:
             asyncio.run(main_local())
         except KeyboardInterrupt:
