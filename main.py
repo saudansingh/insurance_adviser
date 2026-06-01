@@ -34,7 +34,7 @@ INPUT_RATE = 16000   # Mic input rate expected by Gemini Live
 OUTPUT_RATE = 24000  # Speaker output rate sent back by Gemini Live
 CHUNK_SIZE = 1024
 
-# 🛠️ CHANGED: Modern Lifespan utility replaces deprecated @app.on_event
+# Modern Lifespan utility replaces deprecated @app.on_event
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Validate configuration on startup."""
@@ -158,7 +158,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         data = await websocket.receive_bytes()
                         await audio_input_queue.put(data)
                 except (WebSocketDisconnect, Exception):
-                    # Clean mute during standard user disconnects
                     pass
 
             # Handle outgoing audio
@@ -169,7 +168,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_bytes(audio_data)
                         audio_playback_queue.task_done()
                 except (WebSocketDisconnect, Exception):
-                    # Clean mute during standard user disconnects
                     pass
 
             # Start background tasks
@@ -187,23 +185,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 if event and isinstance(event, dict):
                     text_content = event.get("text") or event.get("content")
                     if text_content:
-                        # Append the agent response strings to compile a record
+                        # ✅ KEPT: Append response strings to build the background transcript block
                         current_call_text_segments.append(text_content)
-                        await websocket.send_json({"text": text_content})
+                        
+                        # 🛠️ REMOVED: await websocket.send_json({"text": text_content})
+                        # Dropping this line ensures the frontend UI receives no text frames, keeping it clean!
 
         except WebSocketDisconnect:
             logger.info(f"WebSocket disconnected naturally for user {user_email}")
         except Exception as e:
             logger.error(f"WebSocket session error: {e}")
         finally:
-            # 🛠️ CHANGED: Summary persistence is now executed inside finally block.
-            # This ensures saving works even during abrupt page-closes/hang-ups.
+            # Summary persistence is executed inside the finally block.
             if user_id and current_call_text_segments:
                 summary_text = "".join(current_call_text_segments).strip()
                 if summary_text:
                     try:
                         logger.info(f"Connection ending. Saving Insurance record summary for User ID: {user_id}")
-                        await save_summary(user_id, summary_text[:400], AGENT_ID, db_session)
+                        # 🛠️ CHANGED: Swapped summary_text[:400] to full summary_text to store the entire conversation block inside the DB
+                        await save_summary(user_id, summary_text, AGENT_ID, db_session)
                     except Exception as save_err:
                         logger.error(f"Failed to auto-save summary context block: {save_err}")
 
@@ -306,7 +306,6 @@ async def main_local():
 
 if __name__ == "__main__":
     if ENVIRONMENT == "local":
-        # 🛠️ CHANGED: Removed broken async block out of synchronous space
         try:
             asyncio.run(main_local())
         except KeyboardInterrupt:
