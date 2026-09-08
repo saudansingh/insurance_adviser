@@ -147,8 +147,8 @@ async def websocket_endpoint(websocket: WebSocket):
             gemini_client = GeminiLive(
                 api_key=GEMINI_API_KEY, 
                 model=MODEL, 
-                input_sample_rate=INPUT_RATE,
-                system_instruction=system_instruction
+                input_sample_rate=INPUT_RATE
+                
             )
 
             # Handle incoming WebSocket messages
