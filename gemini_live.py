@@ -11,7 +11,7 @@ class GeminiLive:
     """
     Handles the interaction with the Gemini Live API.
     """
-    def __init__(self, api_key, model="gemini-2.5-flash-native-audio-preview-12-2025", input_sample_rate=16000, tools=None, tool_mapping=None)):
+    def __init__(self, api_key, model="gemini-2.5-flash-native-audio-preview-12-2025", input_sample_rate=16000, tools=None, tool_mapping=None):
         """
         Initializes the GeminiLive client.
 
