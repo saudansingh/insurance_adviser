@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("MODEL", "gemini-2.0-flash-exp")
+MODEL = os.getenv("MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "cloud")  # "local" or "cloud"
 
 # =========================================================================
