@@ -11,7 +11,7 @@ class GeminiLive:
     """
     Handles the interaction with the Gemini Live API.
     """
-    def __init__(self, api_key, model="gemini-2.0-flash-exp", input_sample_rate=16000, tools=None, tool_mapping=None):
+    def __init__(self, api_key, model="gemini-2.0-flash-realtime-exp", input_sample_rate=16000, tools=None, tool_mapping=None):
         """
         Initializes the GeminiLive client.
 
@@ -25,7 +25,7 @@ class GeminiLive:
         self.api_key = api_key
         self.model = model
         self.input_sample_rate = input_sample_rate
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
         self.tools = tools or []
         self.tool_mapping = tool_mapping or {}
 
