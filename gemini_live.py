@@ -17,7 +17,7 @@ class GeminiLive:
 
         Args:
             api_key (str): The Gemini API Key.
-            model (str): The model name to use.
+            model (str): The model name to use (e.g., 'gemini-2.5-flash' or 'gemini-2.0-flash-exp').
             input_sample_rate (int): The sample rate for audio input.
             tools (list, optional): List of tools to enable. Defaults to None.
             tool_mapping (dict, optional): Mapping of tool names to functions. Defaults to None.
@@ -39,17 +39,21 @@ class GeminiLive:
                     )
                 )
             ),
-            system_instruction=types.Content
-                (parts=[types.Part
-                (
-                text="You are an expert Insurance Advisor. "
-                        "At the very start of the session, give a single, brief greeting (e.g., 'Hello, how can I help with your insurance today?'). "
-                        "For all subsequent responses, strictly follow these operational rules:\n"
-                        "1. Be ultra-concise. Deliver punchy, direct answers optimized for a fast voice interface.\n"
-                        "2. Stick exclusively to the topic of the query. Do not offer unrequested background information, over-explain, or use conversational filler.\n"
-                        "3. You must remember and rely on the context of our entire conversation. Connect new answers seamlessly to what we have already discussed without making the user repeat themselves.\n"
-                        "4. Maintain a professional, clear, and objective tone."                
-                )]),
+            system_instruction=types.Content(
+                parts=[
+                    types.Part(
+                        text=(
+                            "You are an expert Insurance Advisor. "
+                            "At the very start of the session, give a single, brief greeting (e.g., 'Hello, how can I help with your insurance today?'). "
+                            "For all subsequent responses, strictly follow these operational rules:\n"
+                            "1. Be ultra-concise. Deliver punchy, direct answers optimized for a fast voice interface.\n"
+                            "2. Stick exclusively to the topic of the query. Do not offer unrequested background information, over-explain, or use conversational filler.\n"
+                            "3. You must remember and rely on the context of our entire conversation. Connect new answers seamlessly to what we have already discussed without making the user repeat themselves.\n"
+                            "4. Maintain a professional, clear, and objective tone."
+                        )
+                    )
+                ]
+            ),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(
@@ -60,54 +64,62 @@ class GeminiLive:
         
         logger.info(f"Connecting to Gemini Live with model={self.model}")
         try:
-          async with self.client.aio.live.connect(model=self.model, config=config) as session:
-            logger.info("Gemini Live session opened successfully")
-            
-            async def send_audio():
-                try:
-                    while True:
-                        chunk = await audio_input_queue.get()
-                        await session.send_realtime_input(
-                            audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={self.input_sample_rate}")
-                        )
-                except asyncio.CancelledError:
-                    logger.debug("send_audio task cancelled")
-                except Exception as e:
-                    logger.error(f"send_audio error: {e}\n{traceback.format_exc()}")
+            async with self.client.aio.live.connect(model=self.model, config=config) as session:
+                logger.info("Gemini Live session opened successfully")
+                
+                # Event gate to halt realtime inputs during tool call execution
+                can_send_input = asyncio.Event()
+                can_send_input.set()
+                
+                async def send_audio():
+                    try:
+                        while True:
+                            chunk = await audio_input_queue.get()
+                            # Pause sending audio while tool call is pending to prevent 1008 Error
+                            await can_send_input.wait()
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={self.input_sample_rate}")
+                            )
+                    except asyncio.CancelledError:
+                        logger.debug("send_audio task cancelled")
+                    except Exception as e:
+                        logger.error(f"send_audio error: {e}\n{traceback.format_exc()}")
 
-            async def send_video():
-                try:
-                    while True:
-                        chunk = await video_input_queue.get()
-                        logger.info(f"Sending video frame to Gemini: {len(chunk)} bytes")
-                        await session.send_realtime_input(
-                            video=types.Blob(data=chunk, mime_type="image/jpeg")
-                        )
-                except asyncio.CancelledError:
-                    logger.debug("send_video task cancelled")
-                except Exception as e:
-                    logger.error(f"send_video error: {e}\n{traceback.format_exc()}")
+                async def send_video():
+                    try:
+                        while True:
+                            chunk = await video_input_queue.get()
+                            # Pause sending video while tool call is pending
+                            await can_send_input.wait()
+                            logger.info(f"Sending video frame to Gemini: {len(chunk)} bytes")
+                            await session.send_realtime_input(
+                                video=types.Blob(data=chunk, mime_type="image/jpeg")
+                            )
+                    except asyncio.CancelledError:
+                        logger.debug("send_video task cancelled")
+                    except Exception as e:
+                        logger.error(f"send_video error: {e}\n{traceback.format_exc()}")
 
-            async def send_text():
-                try:
-                    while True:
-                        text = await text_input_queue.get()
-                        logger.info(f"Sending text to Gemini: {text}")
-                        await session.send_realtime_input(text=text)
-                except asyncio.CancelledError:
-                    logger.debug("send_text task cancelled")
-                except Exception as e:
-                    logger.error(f"send_text error: {e}\n{traceback.format_exc()}")
+                async def send_text():
+                    try:
+                        while True:
+                            text = await text_input_queue.get()
+                            # Pause sending text while tool call is pending
+                            await can_send_input.wait()
+                            logger.info(f"Sending text to Gemini: {text}")
+                            await session.send_realtime_input(text=text)
+                    except asyncio.CancelledError:
+                        logger.debug("send_text task cancelled")
+                    except Exception as e:
+                        logger.error(f"send_text error: {e}\n{traceback.format_exc()}")
 
-            event_queue = asyncio.Queue()
+                event_queue = asyncio.Queue()
 
-            async def receive_loop():
-                try:
-                    while True:
+                async def receive_loop():
+                    try:
                         async for response in session.receive():
                             logger.debug(f"Received response from Gemini: {response}")
                             
-                            # Log the raw response type for debugging
                             if response.go_away:
                                 logger.warning(f"Received GoAway from Gemini: {response.go_away}")
                             if response.session_resumption_update:
@@ -143,64 +155,73 @@ class GeminiLive:
                                     await event_queue.put({"type": "interrupted"})
 
                             if tool_call:
-                                function_responses = []
-                                for fc in tool_call.function_calls:
-                                    func_name = fc.name
-                                    args = fc.args or {}
-                                    
-                                    if func_name in self.tool_mapping:
-                                        try:
-                                            tool_func = self.tool_mapping[func_name]
-                                            if inspect.iscoroutinefunction(tool_func):
-                                                result = await tool_func(**args)
-                                            else:
-                                                loop = asyncio.get_running_loop()
-                                                result = await loop.run_in_executor(None, lambda: tool_func(**args))
-                                        except Exception as e:
-                                            result = f"Error: {e}"
+                                # Block send_realtime_input while processing tool calls
+                                can_send_input.clear()
+                                try:
+                                    function_responses = []
+                                    for fc in tool_call.function_calls:
+                                        func_name = fc.name
+                                        args = fc.args or {}
                                         
-                                        function_responses.append(types.FunctionResponse(
-                                            name=func_name,
-                                            id=fc.id,
-                                            response={"result": result}
-                                        ))
-                                        await event_queue.put({"type": "tool_call", "name": func_name, "args": args, "result": result})
-                                
-                                await session.send_tool_response(function_responses=function_responses)
-                        
-                        # session.receive() iterator ended (e.g. after turn_complete) — re-enter to keep listening
-                        logger.debug("Gemini receive iterator completed, re-entering receive loop")
+                                        if func_name in self.tool_mapping:
+                                            try:
+                                                tool_func = self.tool_mapping[func_name]
+                                                if inspect.iscoroutinefunction(tool_func):
+                                                    result = await tool_func(**args)
+                                                else:
+                                                    loop = asyncio.get_running_loop()
+                                                    result = await loop.run_in_executor(None, lambda: tool_func(**args))
+                                            except Exception as e:
+                                                result = f"Error: {e}"
+                                            
+                                            function_responses.append(
+                                                types.FunctionResponse(
+                                                    name=func_name,
+                                                    id=fc.id,
+                                                    response={"result": result}
+                                                )
+                                            )
+                                            await event_queue.put({
+                                                "type": "tool_call",
+                                                "name": func_name,
+                                                "args": args,
+                                                "result": result
+                                            })
+                                    
+                                    await session.send_tool_response(function_responses=function_responses)
+                                finally:
+                                    # Resume realtime input streaming after tool response is sent
+                                    can_send_input.set()
 
-                except asyncio.CancelledError:
-                    logger.debug("receive_loop task cancelled")
-                except Exception as e:
-                    logger.error(f"receive_loop error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-                    await event_queue.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
-                finally:
-                    logger.info("receive_loop exiting")
-                    await event_queue.put(None)
+                    except asyncio.CancelledError:
+                        logger.debug("receive_loop task cancelled")
+                    except Exception as e:
+                        logger.error(f"receive_loop error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                        await event_queue.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
+                    finally:
+                        logger.info("receive_loop exiting")
+                        await event_queue.put(None)
 
-            send_audio_task = asyncio.create_task(send_audio())
-            send_video_task = asyncio.create_task(send_video())
-            send_text_task = asyncio.create_task(send_text())
-            receive_task = asyncio.create_task(receive_loop())
+                send_audio_task = asyncio.create_task(send_audio())
+                send_video_task = asyncio.create_task(send_video())
+                send_text_task = asyncio.create_task(send_text())
+                receive_task = asyncio.create_task(receive_loop())
 
-            try:
-                while True:
-                    event = await event_queue.get()
-                    if event is None:
-                        break
-                    if isinstance(event, dict) and event.get("type") == "error":
-                        # Just yield the error event, don't raise to keep the stream alive if possible or let caller handle
+                try:
+                    while True:
+                        event = await event_queue.get()
+                        if event is None:
+                            break
+                        if isinstance(event, dict) and event.get("type") == "error":
+                            yield event
+                            break 
                         yield event
-                        break 
-                    yield event
-            finally:
-                logger.info("Cleaning up Gemini Live session tasks")
-                send_audio_task.cancel()
-                send_video_task.cancel()
-                send_text_task.cancel()
-                receive_task.cancel()
+                finally:
+                    logger.info("Cleaning up Gemini Live session tasks")
+                    send_audio_task.cancel()
+                    send_video_task.cancel()
+                    send_text_task.cancel()
+                    receive_task.cancel()
         except Exception as e:
             logger.error(f"Gemini Live session error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             raise
