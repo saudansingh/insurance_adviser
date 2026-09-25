@@ -50,8 +50,8 @@ class GeminiLive:
                         "3. You must remember and rely on the context of our entire conversation. Connect new answers seamlessly to what we have already discussed without making the user repeat themselves.\n"
                         "4. Maintain a professional, clear, and objective tone."                
                 )]),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=None,
+            output_audio_transcription=None,
             realtime_input_config=types.RealtimeInputConfig(
                 turn_coverage="TURN_INCLUDES_ONLY_ACTIVITY",
             ),
